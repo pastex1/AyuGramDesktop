@@ -7,7 +7,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "boxes/reactions_settings_box.h"
 
+#include "base/event_filter.h"
 #include "base/unixtime.h"
+#include "chat_helpers/tabbed_panel.h"
+#include "chat_helpers/tabbed_selector.h"
 #include "data/data_user.h"
 #include "data/data_document.h"
 #include "data/data_document_media.h"
@@ -433,8 +436,14 @@ void ReactionsSettingsBox(
 		not_null<Ui::GenericBox*> box,
 		not_null<Window::SessionController*> controller) {
 
+	using TabbedPanel = ChatHelpers::TabbedPanel;
+	using TabbedSelector = ChatHelpers::TabbedSelector;
+
 	struct State {
 		rpl::variable<Data::ReactionId> selectedId;
+		// Pointer to the custom button so we can update its icon on reselect
+		Ui::RpWidget *customButton = nullptr;
+		rpl::lifetime customIconLifetime;
 	};
 
 	const auto &reactions = controller->session().data().reactions();
@@ -518,13 +527,128 @@ void ReactionsSettingsBox(
 			firstCheckedButton = button;
 		}
 	}
-	if (firstCheckedButton) {
+
+	// --- Custom emoji picker button ---
+	Ui::AddSkip(container);
+	Ui::AddDivider(container);
+	Ui::AddSkip(container);
+
+	const auto customButton = container->add(object_ptr<Ui::SettingsButton>(
+		container,
+		tr::lng_manage_peer_reactions_available_ph(),
+		st::settingsButton));
+	state->customButton = customButton;
+
+	// Show existing custom icon on the button if current favourite is custom
+	const auto updateCustomButtonIcon = [=] {
+		state->customIconLifetime.destroy();
+		const auto currentId = state->selectedId.current();
+		if (const auto customId = currentId.custom()) {
+			const auto iconSize = st::settingsReactionSize;
+			const auto left = customButton->st().iconLeft;
+			auto iconPositionValue = customButton->sizeValue(
+			) | rpl::map([=](const QSize &s) {
+				return QPoint(
+					left + st::settingsReactionRightSkip,
+					(s.height() - iconSize) / 2);
+			});
+			AddReactionCustomIcon(
+				customButton,
+				std::move(iconPositionValue),
+				iconSize,
+				controller,
+				customId,
+				rpl::never<>(),
+				&state->customIconLifetime);
+		}
+	};
+
+	// Init icon for the button
+	updateCustomButtonIcon();
+
+	// Create the emoji panel (hidden by default)
+	const auto emojiPanel = Ui::CreateChild<TabbedPanel>(
+		box->parentWidget() ? box->parentWidget() : box.get(),
+		controller,
+		object_ptr<TabbedSelector>(
+			nullptr,
+			controller->uiShow(),
+			Window::GifPauseReason::Layer,
+			TabbedSelector::Mode::FullReactions));
+	emojiPanel->setDesiredHeightValues(
+		1.,
+		st::emojiPanMinHeight / 2,
+		st::emojiPanMinHeight);
+	emojiPanel->hide();
+
+	// On custom emoji chosen — update selected id and refresh button icon
+	emojiPanel->selector()->customEmojiChosen(
+	) | rpl::on_next([=](ChatHelpers::FileChosen data) {
+		const auto id = Data::ReactionId{ data.document->id };
+		state->selectedId = id;
+		checkButton(customButton);
+		updateCustomButtonIcon();
+		emojiPanel->hideAnimated();
+	}, emojiPanel->lifetime());
+
+	// Position the panel near the button
+	const auto updatePanelGeometry = [=] {
+		const auto parent = emojiPanel->parentWidget();
+		const auto global = customButton->mapToGlobal({ 0, 0 });
+		const auto local = parent->mapFromGlobal(global);
+		emojiPanel->moveBottomRight(
+			local.y(),
+			local.x() + customButton->width());
+	};
+
+	const auto scheduleUpdatePanelGeometry = [=] {
+		crl::on_main(customButton, updatePanelGeometry);
+	};
+
+	const auto filterCallback = [=](not_null<QEvent*> event) {
+		const auto type = event->type();
+		if (type == QEvent::Move || type == QEvent::Resize) {
+			scheduleUpdatePanelGeometry();
+		}
+		return base::EventFilterResult::Continue;
+	};
+	for (auto widget = (QWidget*)customButton
+		; widget && widget != box->parentWidget()
+		; widget = widget->parentWidget()) {
+		base::install_event_filter(customButton, widget, filterCallback);
+	}
+	scheduleUpdatePanelGeometry();
+
+	customButton->installEventFilter(emojiPanel);
+	customButton->addClickHandler([=] {
+		updatePanelGeometry();
+		emojiPanel->toggleAnimated();
+	});
+
+	// Highlight customButton if current selection is a custom emoji
+	state->selectedId.value(
+	) | rpl::on_next([=](const Data::ReactionId &id) {
+		if (id.custom()) {
+			checkButton(customButton);
+		}
+	}, customButton->lifetime());
+
+	// --- end custom emoji picker ---
+
+	if (firstCheckedButton && !state->selectedId.current().custom()) {
 		firstCheckedButton->geometryValue(
 		) | rpl::filter([=](const QRect &r) {
 			return r.isValid();
 		}) | rpl::take(1) | rpl::on_next([=] {
 			checkButton(firstCheckedButton);
 		}, firstCheckedButton->lifetime());
+	} else if (state->selectedId.current().custom()) {
+		customButton->geometryValue(
+		) | rpl::filter([=](const QRect &r) {
+			return r.isValid();
+		}) | rpl::take(1) | rpl::on_next([=] {
+			checkButton(customButton);
+		}, customButton->lifetime());
 	}
 	check->raise();
 
